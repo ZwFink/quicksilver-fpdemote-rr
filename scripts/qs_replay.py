@@ -11,8 +11,8 @@ Uses only Mneme's public Python pieces plus existing native exports:
     since Mneme's Python API has no way to read device memory after a launch.
 
 Each repeat writes <out>/run<i>.npz with the post-launch image (same layout as the
-recorded snapshots, see mneme_snapshot.save_image). Mneme's own verify verdict is
-recorded in <out>/summary.json for reference only.
+recorded snapshots, see mneme_snapshot.save_image). The optimized IR goes to
+<out>/kernel.opt.ll.
 
 Example:
   python qs_replay.py --record-db run-rec/db/X.json --out replay \
@@ -23,11 +23,8 @@ Example:
 
 import argparse
 import ctypes
-import json
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -36,12 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mneme_snapshot import MemoryImage, Blob, read_snapshot, save_image  # noqa: E402
 
 from mneme.device import DeviceModule  # noqa: E402
-from mneme.llvm import ffi  # noqa: E402
 from mneme.proteus import jit  # noqa: E402
 from mneme.replay_executor import BaseExecutor  # noqa: E402
 
 HIP_MEMCPY_DEVICE_TO_HOST = 2
-LLVM_OBJDUMP = os.path.join(os.environ["ROCM_PATH"], "llvm", "bin", "llvm-objdump")
 
 
 def _hip():
@@ -72,33 +67,6 @@ def read_device_image(hip, layout: MemoryImage) -> MemoryImage:
     return out
 
 
-def object_bytes(mem_buffer) -> bytes:
-    lib = ffi.lib
-    lib.LLVMPY_GetBufferStart.argtypes = [ffi.LLVMMemBufferRef]
-    lib.LLVMPY_GetBufferStart.restype = ctypes.c_void_p
-    start = lib.LLVMPY_GetBufferStart(mem_buffer)
-    return ctypes.string_at(start, mem_buffer.get_size())
-
-
-def isa_op_counts(asm: str) -> dict:
-    """Count VALU floating-point instructions by precision suffix in a disassembly."""
-    counts = {}
-    for line in asm.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        op = parts[0]
-        if not op.startswith("v_"):
-            continue
-        for suffix in ("_f64", "_f32", "_f16"):
-            if suffix in op:
-                counts[suffix[1:]] = counts.get(suffix[1:], 0) + 1
-                counts.setdefault("ops", {})
-                counts["ops"][op] = counts["ops"].get(op, 0) + 1
-                break
-    return counts
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--record-db", required=True, help="recording JSON (one kernel)")
@@ -121,49 +89,25 @@ def main():
                       device_id=a.device, pass_plugins=a.pass_plugin)
     kd = ex.kernel_descr
     layout = read_snapshot(kd.prologue.fn)
-    summary = {
-        "record_db": os.path.abspath(a.record_db), "record_id": ex.record_id,
-        "kernel": kd.kernel_name, "grid": kd.grid_dim.to_dict(), "block": kd.block_dim.to_dict(),
-        "shared_mem": kd.shared_mem, "pipeline": a.pipeline, "pass_plugins": a.pass_plugin,
-        "purge_autoinit": a.purge_autoinit, "codegen_opt": a.codegen_opt,
-        "device_arch": ex.device_arch, "proteus_codegen": os.environ.get("PROTEUS_CODEGEN"),
-        "runs": [],
-    }
 
     root_ir = ex.link_ir()
     # Raises jit.InvalidPassPipelineError (e.g. a misspelled plugin pass) before any
     # device state is mapped.
     jit.check_pass_pipeline(root_ir, ex.device_arch, a.pipeline, a.codegen_opt)
     with ex:
-        summary["noop_verifies"] = bool(ex.noop_verifies)
         mod = root_ir.clone()
-        t0 = time.time()
         if a.purge_autoinit:
             jit.optimize(mod, ex.device_arch, "purge-autoinit", a.codegen_opt)
         jit.optimize(mod, ex.device_arch, a.pipeline, a.codegen_opt)
-        summary["opt_seconds"] = time.time() - t0
         (out / "kernel.opt.ll").write_text(str(mod))
         mem_buffer = jit.codegen_object(mod, ex.device_arch, a.codegen_opt)
-        (out / "kernel.o").write_bytes(object_bytes(mem_buffer))
-        asm = subprocess.run([LLVM_OBJDUMP, "-d", "--mcpu=" + ex.device_arch.split(":")[0],
-                              str(out / "kernel.o")], check=True, capture_output=True, text=True).stdout
-        (out / "kernel.s").write_text(asm)
-        summary["isa_fp_ops"] = isa_op_counts(asm)
 
         with DeviceModule.from_MemBuffer(mem_buffer) as dm:
             fn = dm.get_function(kd.kernel_name)
-            summary["reg_usage"] = fn.reg_usage
-            summary["local_mem"] = fn.local_mem
             for i in range(a.repeats):
                 fn.profile(kd.grid_dim, kd.block_dim, ex.prologue._state, ex.epilogue._state, kd.shared_mem, 1)
-                img = read_device_image(hip, layout)
-                save_image(str(out / f"run{i}.npz"), img)
-                mneme_verified = bool(ex.prologue == ex.epilogue)
-                summary["runs"].append({"image": f"run{i}.npz", "mneme_verify": mneme_verified})
-                print(f"[qs_replay] run {i}: image saved, Mneme exact verify = {mneme_verified}", flush=True)
-
-    (out / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(json.dumps({k: v for k, v in summary.items() if k != "runs"}, indent=2))
+                save_image(str(out / f"run{i}.npz"), read_device_image(hip, layout))
+                print(f"[qs_replay] run {i}: image saved to {out / f'run{i}.npz'}", flush=True)
 
 
 if __name__ == "__main__":

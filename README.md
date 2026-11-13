@@ -78,8 +78,7 @@ Then run `setup.sh` in the new location.
    - It launches the kernel one time.
    - It saves the device memory after the launch to `replay/run0.npz`.
 
-   The `replay/` directory also holds the JIT output (`kernel.opt.ll`, `kernel.s`, `kernel.o`).
-   It also holds `summary.json`, which contains the pipeline, the register count and the counts of FP operations in the ISA.
+   The `replay/` directory also holds the demoted IR, `kernel.opt.ll`.
 3. **Compare.**
    `scripts/qs_compare.py` compares the output of the replay with the FP64 output of the recording.
    The script prints the relative L2 error of the scalar flux.
